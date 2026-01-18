@@ -632,7 +632,11 @@ class GeminiAnalyzer:
                 # 请求前增加延时（防止请求过快触发限流）
                 if attempt > 0:
                     delay = base_delay * (2 ** (attempt - 1))  # 指数退避: 5, 10, 20, 40...
-                    delay = min(delay, 60)  # 最大60秒
+                    # 针对配额限制的情况增加更长的延迟
+                    if 'quota' in str(last_error).lower() or 'exceeded' in str(last_error).lower():
+                        delay *= 3  # 配额限制时延迟增加3倍
+                        logger.info("[Gemini] 检测到配额限制，增加重试延迟")
+                    delay = min(delay, 120)  # 最大120秒（从60秒增加）
                     logger.info(f"[Gemini] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
                     time.sleep(delay)
                 
@@ -653,11 +657,24 @@ class GeminiAnalyzer:
                 
                 # 检查是否是 429 限流错误
                 is_rate_limit = '429' in error_str or 'quota' in error_str.lower() or 'rate' in error_str.lower()
+                is_quota_exceeded = 'quota' in error_str.lower() and 'exceeded' in error_str.lower()
                 
-                if is_rate_limit:
-                    logger.warning(f"[Gemini] API 限流 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                if is_quota_exceeded:
+                    # 配额耗尽的特殊处理
+                    logger.warning(f"[Gemini] API 配额耗尽 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:150]}")
+                    logger.warning("[Gemini] 建议：1. 检查 Gemini API 配额使用情况 2. 考虑升级 Gemini 订阅计划 3. 配置 OpenAI 作为备选")
                     
-                    # 如果已经重试了一半次数且还没切换过备选模型，尝试切换
+                    # 配额耗尽时更早切换模型
+                    if not tried_fallback:
+                        if self._switch_to_fallback_model():
+                            tried_fallback = True
+                            logger.info("[Gemini] 已切换到备选模型，继续重试")
+                        else:
+                            logger.warning("[Gemini] 切换备选模型失败，继续使用当前模型重试")
+                elif is_rate_limit:
+                    logger.warning(f"[Gemini] API 速率限制 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                    
+                    # 速率限制时的模型切换
                     if attempt >= max_retries // 2 and not tried_fallback:
                         if self._switch_to_fallback_model():
                             tried_fallback = True
@@ -675,6 +692,9 @@ class GeminiAnalyzer:
                 return self._call_openai_api(prompt, generation_config)
             except Exception as openai_error:
                 logger.error(f"[OpenAI] 备选 API 也失败: {openai_error}")
+                # 检查是否是配额问题
+                if isinstance(last_error, Exception) and 'quota' in str(last_error).lower():
+                    raise Exception(f"Gemini API 配额耗尽，OpenAI 备选也失败: {last_error}")
                 raise last_error or openai_error
         elif config.openai_api_key and config.openai_base_url:
             # 尝试懒加载初始化 OpenAI
@@ -685,9 +705,23 @@ class GeminiAnalyzer:
                     return self._call_openai_api(prompt, generation_config)
                 except Exception as openai_error:
                     logger.error(f"[OpenAI] 备选 API 也失败: {openai_error}")
+                    # 检查是否是配额问题
+                    if isinstance(last_error, Exception) and 'quota' in str(last_error).lower():
+                        raise Exception(f"Gemini API 配额耗尽，OpenAI 备选也失败: {last_error}")
                     raise last_error or openai_error
         
-        # 所有方式都失败
+        # 所有方式都失败，检查是否是配额问题
+        if isinstance(last_error, Exception) and 'quota' in str(last_error).lower():
+            raise Exception(
+                f"[Gemini] API 配额耗尽，已达最大重试次数 ({max_retries}次)。"\
+                f"\n建议：\n1. 检查 Gemini API 控制台的配额使用情况\n"\
+                f"2. 考虑升级 Gemini 订阅计划\n"\
+                f"3. 配置 OpenAI API 作为备选方案\n"\
+                f"4. 减少每天的分析次数或股票数量\n"\
+                f"\n原始错误: {last_error}"
+            )
+        
+        # 其他错误
         raise last_error or Exception("所有 AI API 调用失败，已达最大重试次数")
     
     def analyze(
